@@ -1,0 +1,124 @@
+name: Sync Upstream Code & Releases (Smart Mirror)
+
+on:
+  push:
+    branches: [ main ]
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+# 在这里设置全局开关
+env:
+  KEEP_LOCAL_RELEASES: false  # 设置为 true 则保留本地独有的 Release，设置为 false 则同步删除
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup git identity
+        run: |
+          git config --global user.name "woshishiq1"
+          git config --global user.email "1987669587@qq.com"
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/Qeccentric/GlobalTraveling.git || true
+          git fetch upstream --tags
+          git fetch upstream main
+
+      - name: Backup local workflows
+        run: |
+          mkdir -p /tmp/my-workflow
+          cp -a .github/workflows /tmp/my-workflow/ 2>/dev/null || true
+
+      - name: Sync upstream code safely
+        run: |
+          set -e
+          BEFORE_SHA=$(git rev-parse HEAD)
+          git checkout main
+          git reset --hard upstream/main
+          AFTER_SHA=$(git rev-parse HEAD)
+          
+          if [ "$BEFORE_SHA" = "$AFTER_SHA" ]; then
+            echo "Upstream code unchanged, skip push."
+          else
+            mkdir -p .github
+            cp -a /tmp/my-workflow/workflows .github/ 2>/dev/null || true
+            git add -A
+            git commit -m "Sync upstream code $(date +%F)" || true
+            git push origin main --force
+            git push origin --tags --force
+          fi
+
+      - name: Sync releases (smart mirror)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          UPSTREAM_REPO="Qeccentric/GlobalTraveling"
+          TARGET_REPO="${{ github.repository }}"
+
+          UPSTREAM_TAGS=$(gh release list --repo "$UPSTREAM_REPO" --limit 100 --json tagName -q '.[].tagName' | sort || true)
+          TARGET_TAGS=$(gh release list --repo "$TARGET_REPO" --limit 100 --json tagName -q '.[].tagName' | sort || true)
+
+          echo "Checking for release updates..."
+          mkdir -p /tmp/release-assets
+          
+          # --------------------------------------------------
+          # 1. 处理删除逻辑 (受开关控制)
+          # --------------------------------------------------
+          if [ "${{ env.KEEP_LOCAL_RELEASES }}" = "false" ]; then
+            echo "KEEP_LOCAL_RELEASES is false. Deleting releases not present in upstream..."
+            for tag in $TARGET_TAGS; do
+              if ! echo "$UPSTREAM_TAGS" | grep -Fxq "$tag"; then
+                echo "Deleting obsolete release: $tag"
+                gh release delete "$tag" --repo "$TARGET_REPO" --yes || true
+                git push origin ":refs/tags/$tag" || true
+              fi
+            done
+          else
+            echo "KEEP_LOCAL_RELEASES is true. Skipping deletion of local-only releases."
+          fi
+
+          # --------------------------------------------------
+          # 2. 同步或更新每一个 Release
+          # --------------------------------------------------
+          for tag in $UPSTREAM_TAGS; do
+            echo "Processing release: $tag"
+            cd /tmp/release-assets
+            rm -rf *
+
+            rel_json=$(gh release view "$tag" --repo "$UPSTREAM_REPO" --json name,body,isPrerelease)
+            rel_name=$(echo "$rel_json" | jq -r '.name')
+            rel_body=$(echo "$rel_json" | jq -r '.body')
+            rel_is_pre=$(echo "$rel_json" | jq -r '.isPrerelease')
+
+            if gh release view "$tag" --repo "$TARGET_REPO" &>/dev/null; then
+              echo "Release $tag exists. Syncing metadata..."
+              gh release edit "$tag" --repo "$TARGET_REPO" \
+                --title "$rel_name" \
+                --notes "$rel_body" \
+                --prerelease=$rel_is_pre
+            else
+              echo "New release detected: $tag. Creating..."
+              gh release download "$tag" --repo "$UPSTREAM_REPO" --skip-existing || true
+              
+              ARGS=("$tag" --repo "$TARGET_REPO" --title "$rel_name" --notes "$rel_body")
+              [ "$rel_is_pre" = "true" ] && ARGS+=("--prerelease")
+              
+              mapfile -t files < <(find . -type f ! -name ".*")
+              if [[ ${#files[@]} -gt 0 ]]; then
+                gh release create "${ARGS[@]}" "${files[@]}"
+              else
+                gh release create "${ARGS[@]}"
+              fi
+            fi
+          done
+          
+          echo "All releases are in sync with upstream!"
