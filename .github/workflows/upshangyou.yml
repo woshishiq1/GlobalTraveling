@@ -7,9 +7,8 @@ on:
     - cron: '0 */6 * * *'
   workflow_dispatch:
 
-# 在这里设置全局开关
 env:
-  KEEP_LOCAL_RELEASES: false  # 设置为 true 则保留本地独有的 Release，设置为 false 则同步删除
+  KEEP_LOCAL_RELEASES: true  # 保持为 true，保护本地已同步的发行版
 
 jobs:
   sync:
@@ -29,32 +28,40 @@ jobs:
       - name: Fetch upstream
         run: |
           git remote add upstream https://github.com/Qeccentric/GlobalTraveling.git || true
-          git fetch upstream --tags
-          git fetch upstream main
+          git fetch upstream main --tags
 
-      - name: Backup local workflows
-        run: |
-          mkdir -p /tmp/my-workflow
-          cp -a .github/workflows /tmp/my-workflow/ 2>/dev/null || true
-
-      - name: Sync upstream code safely
+      - name: Sync upstream code (Mirror Commit Message)
         run: |
           set -e
-          BEFORE_SHA=$(git rev-parse HEAD)
-          git checkout main
+          # 1. 备份本地 Workflows (包含你的同步脚本)
+          mkdir -p /tmp/my-workflows
+          cp -a .github/workflows/* /tmp/my-workflows/ 2>/dev/null || true
+
+          # 2. 获取上游最新的提交信息
+          UPSTREAM_MSG=$(git log upstream/main -1 --format=%s)
+          echo "Latest upstream message: $UPSTREAM_MSG"
+
+          # 3. 强制重置到上游状态
+          git checkout -B main
           git reset --hard upstream/main
-          AFTER_SHA=$(git rev-parse HEAD)
-          
-          if [ "$BEFORE_SHA" = "$AFTER_SHA" ]; then
-            echo "Upstream code unchanged, skip push."
+
+          # 4. 还原自己的 Workflows (cp -n 确保如果上游新增了 workflow 也会被保留)
+          mkdir -p .github/workflows
+          cp -n /tmp/my-workflows/* .github/workflows/ 2>/dev/null || true
+
+          # 5. 检查是否有实质性代码变化 (排除 Workflows 目录后的对比)
+          # 注意：这里的逻辑是如果上游代码变了，或者上游新加了 Workflow，都会触发
+          if git diff --quiet HEAD origin/main -- . ':!.github/workflows'; then
+            echo "No meaningful upstream changes detected. Skipping commit."
           else
-            mkdir -p .github
-            cp -a /tmp/my-workflow/workflows .github/ 2>/dev/null || true
+            echo "Upstream changes detected. Committing with upstream message..."
             git add -A
-            git commit -m "Sync upstream code $(date +%F)" || true
+            # 使用上游的提交信息，实现“视觉完美同步”
+            git commit -m "$UPSTREAM_MSG" || true
             git push origin main --force
-            git push origin --tags --force
           fi
+          # 始终同步标签
+          git push origin --tags --force
 
       - name: Sync releases (smart mirror)
         env:
@@ -67,58 +74,31 @@ jobs:
           UPSTREAM_TAGS=$(gh release list --repo "$UPSTREAM_REPO" --limit 100 --json tagName -q '.[].tagName' | sort || true)
           TARGET_TAGS=$(gh release list --repo "$TARGET_REPO" --limit 100 --json tagName -q '.[].tagName' | sort || true)
 
-          echo "Checking for release updates..."
           mkdir -p /tmp/release-assets
           
-          # --------------------------------------------------
-          # 1. 处理删除逻辑 (受开关控制)
-          # --------------------------------------------------
           if [ "${{ env.KEEP_LOCAL_RELEASES }}" = "false" ]; then
-            echo "KEEP_LOCAL_RELEASES is false. Deleting releases not present in upstream..."
             for tag in $TARGET_TAGS; do
               if ! echo "$UPSTREAM_TAGS" | grep -Fxq "$tag"; then
-                echo "Deleting obsolete release: $tag"
                 gh release delete "$tag" --repo "$TARGET_REPO" --yes || true
                 git push origin ":refs/tags/$tag" || true
               fi
             done
-          else
-            echo "KEEP_LOCAL_RELEASES is true. Skipping deletion of local-only releases."
           fi
 
-          # --------------------------------------------------
-          # 2. 同步或更新每一个 Release
-          # --------------------------------------------------
           for tag in $UPSTREAM_TAGS; do
-            echo "Processing release: $tag"
-            cd /tmp/release-assets
-            rm -rf *
-
+            cd /tmp/release-assets && rm -rf *
             rel_json=$(gh release view "$tag" --repo "$UPSTREAM_REPO" --json name,body,isPrerelease)
             rel_name=$(echo "$rel_json" | jq -r '.name')
             rel_body=$(echo "$rel_json" | jq -r '.body')
             rel_is_pre=$(echo "$rel_json" | jq -r '.isPrerelease')
 
             if gh release view "$tag" --repo "$TARGET_REPO" &>/dev/null; then
-              echo "Release $tag exists. Syncing metadata..."
-              gh release edit "$tag" --repo "$TARGET_REPO" \
-                --title "$rel_name" \
-                --notes "$rel_body" \
-                --prerelease=$rel_is_pre
+              gh release edit "$tag" --repo "$TARGET_REPO" --title "$rel_name" --notes "$rel_body" --prerelease=$rel_is_pre
             else
-              echo "New release detected: $tag. Creating..."
               gh release download "$tag" --repo "$UPSTREAM_REPO" --skip-existing || true
-              
               ARGS=("$tag" --repo "$TARGET_REPO" --title "$rel_name" --notes "$rel_body")
               [ "$rel_is_pre" = "true" ] && ARGS+=("--prerelease")
-              
               mapfile -t files < <(find . -type f ! -name ".*")
-              if [[ ${#files[@]} -gt 0 ]]; then
-                gh release create "${ARGS[@]}" "${files[@]}"
-              else
-                gh release create "${ARGS[@]}"
-              fi
+              [[ ${#files[@]} -gt 0 ]] && gh release create "${ARGS[@]}" "${files[@]}" || gh release create "${ARGS[@]}"
             fi
           done
-          
-          echo "All releases are in sync with upstream!"
